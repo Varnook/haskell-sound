@@ -1,45 +1,78 @@
 import qualified Data.ByteString.Lazy as B
 import qualified Data.ByteString.Builder as B
 import Data.Foldable
+import System.Process
 
-audioFile :: String -> [Float] -> IO()
-audioFile file sound = B.writeFile file $ B.toLazyByteString $ fold $ map B.floatLE sound
+type Beat = Float
+type Sec  = Float
+type Hz   = Float
+type Wave = [Float]
+type Note = [Float]
 
-rate :: Float
+data WaveShape = Sin | Sqr | Saw | Tri               deriving (Enum, Bounded, Show)
+data Chord = Major | Minor | Dim | VII | Maj7 | Min7 deriving (Enum, Bounded, Show)
+
+rate :: Hz
 rate = 44100
 
-wave :: Float -> Float -> Float -> [Float]
-wave duration amp freq = [amp * sin(freq' * t) | t <- [0.0 .. rate * duration]]
+bpm :: Beat
+bpm = 120
+
+bpmHelper :: Sec
+bpmHelper = 60 / bpm
+
+inf :: Float
+inf = 1/0
+
+getWave :: WaveShape -> (Float -> Float -> Float -> Float)
+getWave Sin = (\ amp freq t -> amp * sin(freq * t))
+getWave Tri = (\ amp freq t -> (2*amp / pi) * asin(sin(freq * t)))
+getWave Sqr = (\ amp freq t -> amp * signum(sin(freq * t)))
+getWave Saw = (\ amp freq t -> (2*amp / pi) * atan(cot(freq * t)))
+     where cot x = 1 / (tan x)
+
+audioFile :: String -> Wave -> IO()
+audioFile file sound = B.writeFile file $ B.toLazyByteString $ fold $ map B.floatLE sound
+
+playAudio :: String -> IO()
+playAudio file = callCommand $ "aplay -t RAW -f FLOAT_LE -c2 -r " ++ show (truncate rate) ++ " " ++ file
+
+saveAndPlay :: String -> Wave -> IO()
+saveAndPlay file sound = do
+                         audioFile file sound
+                         playAudio file
+
+wave :: Sec -> WaveShape -> Float -> Hz -> Wave
+wave duration shape amp freq = [ getWave shape amp freq' t | t <- [0.0 .. rate * duration]]
     where freq' = 2*pi*freq / rate
 
-amplify :: Float -> [Float] -> [Float]
+amplify :: Float -> Wave -> Wave
 amplify vol = map (vol*)
 
-lfoAmp :: Float -> [Float] -> [Float]
-lfoAmp beats sound = zipWith (*) volWave sound
+linearAmp :: Float -> Float -> Wave -> Wave
+linearAmp start step = zipWith (*) [start, (start + step) .. ]
+
+lfoAmp :: Hz -> WaveShape -> Wave -> Wave
+lfoAmp lowFreq shape = zipWith (*) volWave 
     where 
-    volWave = map abs $ amplify 1 (wave dur 1 (beats / 2))
-    dur     = (fromIntegral $ length sound) / rate
+    volWave = map abs $ wave inf shape 1 lowFreq
 
-fadeInOut :: Float -> Float -> Float -> Float -> [Float] -> [Float]
-fadeInOut dur start stop at audio = (take begin audio) ++ (zipWith (*) (drop begin audio) fadeWave) ++ (drop end audio)
+fadeInOut :: Sec -> Sec -> Float -> Float -> Wave -> Wave
+fadeInOut dur at start stop audio = take at' audio ++ linearAmp start step (drop at' audio) ++ drop end audio
     where
-    begin = truncate (rate * at)
-    end   = truncate (rate * (at + dur))
-    fadeWave = if start > 1 then 
-                  map (start+) fadeWave'
-               else 
-                  if m < 0 then
-                     map ((-1)*) $ reverse fadeWave'
-                  else
-                     fadeWave'
-    fadeWave' = map (m*) [0.0 .. rate * dur]
-    m = (stop - start) / (rate * dur)
+    at'  = truncate (rate * at)
+    end  = truncate (rate * (at + dur))
+    step = (stop - start) / (rate * dur)
 
-envelope :: Float -> Float -> Float -> Float -> Float -> [Float] -> [Float]
-envelope atk dec sus rel peak audio = fadeInOut atk 0 peak 0 (fadeInOut dec peak 1 atk $ fadeInOut rel 1 0 (atk + dec + sus) audio)
-
-data Chord = Major | Minor | Dim | VII | Maj7 | Min7 deriving (Enum, Bounded, Show)
+-- No esta andando
+envelope :: Float -> Float -> Float -> Float -> Wave -> Wave
+envelope atk dec rel peak audio = 
+    let audioLen = fromIntegral $ length audio
+        atkDur   = atk * audioLen
+        decDur   = dec * audioLen
+        relDur   = rel * audioLen
+        relAt    = audioLen - relDur
+    in  fadeInOut atkDur 0 0 peak . fadeInOut decDur atkDur peak 1 . fadeInOut relDur relAt 1 0 $ audio
 
 chordRatio :: Chord -> [Float]
 chordRatio Major = [4, 3]
@@ -49,8 +82,8 @@ chordRatio VII   = [4, 3, 3]
 chordRatio Maj7  = [4, 3, 4]
 chordRatio Min7  = [3, 4, 3]
 
-chord :: Float -> Float -> Float -> Chord -> [Float]
-chord duration amp freq tipo = foldr1 (zipWith (+)) $ map (wave duration $ (/) amp $ ratLen) freqList
+chord :: Float -> WaveShape -> Float -> Float -> Chord -> [Float]
+chord duration shape amp freq tipo = foldr1 (zipWith (+)) $ map (wave duration shape $ (/) amp $ ratLen) freqList
     where 
     freqList = freq : [freq * (2**(n/12)) | n <- scanl1 (+) ratios] 
     ratLen   = 1 + (fromIntegral $ length ratios)
